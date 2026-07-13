@@ -580,5 +580,5 @@ def build_full_dashboard(
         "quarterly_summary":   quarterly_summary(bookings),
         "duration_dist":       duration_distribution(bookings),
         "host_type_detail":    host_type_detail(bookings, host_summary),
-        "validation":          validation.to_dict() if hasattr(validation, "to_dict") else {},
+        "validation":          validation.to_dict() if hasattr(validation, "to_dict") else validation,
     }

@@ -8,12 +8,22 @@ Parses the three EMS report formats exported from the booking system:
 
 Design decisions
 ----------------
+- Column positions are NEVER hardcoded. Every field (Start, End, Host,
+  Res ID, Net Sales, Gross Sales, ...) is located at runtime by scanning
+  the report's header block for label text ("dynamic schema resolution",
+  see `_build_field_map`). If a future export reorders, adds, or renames
+  columns, the parser adapts instead of silently reading the wrong field.
+  Callers may also supply an explicit `schema_map` override for files
+  whose headers don't match the built-in aliases (see `parse_ems_files`).
+- The Net/Gross "role" of a booking file (which money column it holds)
+  is auto-detected from its header, not assumed from the caller's label.
 - We NEVER impute or fabricate missing monetary values.
   If a row genuinely has no sales figure we record 0.0 (the EMS system
   exports a blank cell when a booking is $0, e.g. internal-ASU events).
 - Data-quality issues (duplicate Res IDs, mismatched Net vs Gross,
-  non-numeric sales) are logged in a validation report returned alongside
-  the parsed frames so the UI can surface them.
+  non-numeric sales, merge reconciliation failures) are logged in a
+  validation report returned alongside the parsed frames so the UI can
+  surface them.
 - All string cleaning is limited to whitespace/newline normalisation and
   capitalisation; we do not rename hosts or merge similar-looking names
   automatically (that would silently alter business data).
@@ -25,12 +35,14 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+SchemaOverride = dict  # {canonical_field: column_index (int) | header text (str)}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -115,99 +127,246 @@ def _extract_reporting_period(raw_df: pd.DataFrame) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Dynamic schema resolution
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Every EMS export wraps its column headers across a few stacked rows above
+# the first data row (e.g. "Payment Type" and "Res ID" appear several rows
+# apart from "Start"/"End"/"Host"). Rather than hardcode column positions
+# for one specific layout, we scan the header block for label text and
+# build a {canonical_field: column_index} map at parse time. This is what
+# lets the same code handle a file whose columns have shifted, been added
+# to, or been reordered — the requirement is "derive schema/headers/values
+# dynamically", not "assume today's export forever".
+
+BOOKING_FIELD_ALIASES: dict[str, list[str]] = {
+    "start":        ["start"],
+    "end":          ["end"],
+    "host":         ["host"],
+    "event_name":   ["event name/location", "event name", "location"],
+    "payment_type": ["payment type", "billing type"],
+    "status":       ["booking status", "status"],
+    "res_id":       ["res id", "reservation id"],
+    "net_sales":    ["net sales", "net revenue", "net amount"],
+    "gross_sales":  ["gross sales", "gross revenue", "gross amount"],
+}
+BOOKING_REQUIRED_FIELDS = ("start", "end", "host", "res_id")
+
+HOST_FIELD_ALIASES: dict[str, list[str]] = {
+    "host_type":   ["host type", "client type", "segment"],
+    "host":        ["host", "client"],
+    "setup_count": ["setup count", "setups"],
+    "attendance":  ["attendance", "attendees"],
+    "gross_sales": ["gross sales", "gross revenue"],
+}
+HOST_REQUIRED_FIELDS = ("host", "gross_sales")
+
+
+def _build_field_map(
+    raw_df: pd.DataFrame,
+    field_aliases: dict[str, list[str]],
+    header_rows: int = 12,
+) -> dict[str, int]:
+    """
+    Discover which column holds each canonical field by scanning the
+    report's header block (the first `header_rows` rows) for label text,
+    accumulating matches across the whole block since EMS headers are
+    frequently split across several stacked rows rather than one.
+
+    Aliases are matched longest-first so a specific label (e.g. "host
+    type") claims its column before a more generic one (e.g. "host") is
+    considered for a different field, and each column is claimed at most
+    once.
+    """
+    n_rows = min(header_rows, len(raw_df))
+    n_cols = raw_df.shape[1]
+    cells: list[tuple[int, str]] = []
+    for r in range(n_rows):
+        for c in range(n_cols):
+            text = _clean_str(raw_df.iat[r, c]).lower()
+            if text:
+                cells.append((c, text))
+
+    alias_items = sorted(
+        ((f, a) for f, aliases in field_aliases.items() for a in aliases),
+        key=lambda item: len(item[1]),
+        reverse=True,
+    )
+
+    # Two passes: exact-text matches first, then substring fallback. This
+    # matters because report titles/captions (e.g. "Sales by Host") can
+    # contain a field's alias as a substring ("host") — an exact-match pass
+    # finds the real "Host" header column first and locks it in before the
+    # substring pass would otherwise mis-claim the title cell.
+    field_map: dict[str, int] = {}
+    used_cols: set[int] = set()
+    for match_mode in ("exact", "contains"):
+        for f, alias in alias_items:
+            if f in field_map:
+                continue
+            for col, text in cells:
+                if col in used_cols:
+                    continue
+                hit = (text == alias) if match_mode == "exact" else (alias in text)
+                if hit:
+                    field_map[f] = col
+                    used_cols.add(col)
+                    break
+    return field_map
+
+
+def _apply_schema_overrides(
+    raw_df: pd.DataFrame,
+    field_map: dict[str, int],
+    schema_map: Optional[SchemaOverride],
+) -> dict[str, int]:
+    """
+    Layer caller-supplied overrides on top of the auto-detected field map.
+    Each override may be an explicit column index (int) or header text to
+    search for (str) — the manual escape hatch for files whose columns
+    differ enough that keyword auto-detection can't resolve them.
+    """
+    if not schema_map:
+        return field_map
+    resolved = dict(field_map)
+    for f, override in schema_map.items():
+        if isinstance(override, bool):
+            continue
+        if isinstance(override, int):
+            resolved[f] = override
+        elif isinstance(override, str):
+            match = _build_field_map(raw_df, {f: [override.lower()]})
+            if f in match:
+                resolved[f] = match[f]
+    return resolved
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Booking file parser  (Net Sales & Gross Sales share the same layout)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_booking_sheet(
     raw_df: pd.DataFrame,
-    sales_col_name: str,
     report: ValidationReport,
-) -> pd.DataFrame:
+    schema_map: Optional[SchemaOverride] = None,
+) -> tuple[pd.DataFrame, str]:
     """
-    Column map (0-indexed, from the EMS export):
-      0  – Start datetime
-      1  – End datetime
-      2  – Host (client / department name)
-      5  – Event Name / Location
-      11 – Payment type / billing code
-      13 – Booking status
-      16 – Res ID (the room reservation ID that appears on row N)
-           Book ID appears on row N+1 in the same column
-      18 – Net Sales *or* Gross Sales (depends on the file)
+    Parse a "Sales by Booking" export (Net or Gross flavour). Every field's
+    column position — including whether this file holds Net Sales or Gross
+    Sales — is resolved at runtime from the header block via
+    `_build_field_map`; nothing is assumed from a fixed layout or from the
+    caller's file-role label.
 
     The EMS export is a merged-cell report:
       • Row pattern per booking:
           Row A: start, end, host, event_name, payment_type, status, res_id, sales
-          Row B: blank except col-16 = book_id
-          Row C: blank except col-5  = room_name
-        (sometimes rows B and C are swapped or col-5 room appears on a 4th row)
-      • Date-header rows: col-0 = date@midnight, col-1 = NaT
-      • Total rows: 'Date Total' / 'Month Total' in col-14
-      • Page break rows: 'Page N of N' in col-14 or col-15
+          Row B: blank except the Res ID column, which holds the Book ID
+          Row C: blank except the Event Name column, which holds the Room name
+        (sometimes rows B and C are swapped or the room appears on a 4th row)
+      • Date-header rows: start = date@midnight, end = NaT
+      • Total rows: 'Date Total' / 'Month Total' / 'Grand Total'
+      • Page break rows: 'Page N of N'
+
+    Returns (dataframe, sales_col_name) where sales_col_name is
+    "Net Sales" or "Gross Sales", whichever was found in this file's header.
     """
     report.total_rows_raw += len(raw_df)
+
+    field_map = _build_field_map(raw_df, BOOKING_FIELD_ALIASES)
+    field_map = _apply_schema_overrides(raw_df, field_map, schema_map)
+
+    missing = [f for f in BOOKING_REQUIRED_FIELDS if f not in field_map]
+    if missing:
+        report.errors.append(
+            f"Could not locate required column(s) {missing} in the booking file "
+            "header — parsing aborted. Pass a schema_map override if this file "
+            "uses non-standard column labels."
+        )
+        return pd.DataFrame(), "Sales"
+
+    has_net, has_gross = "net_sales" in field_map, "gross_sales" in field_map
+    if has_net and has_gross:
+        report.warnings.append(
+            "Both 'Net Sales' and 'Gross Sales' headers were found in the same "
+            "booking file; defaulting to Net Sales. Pass schema_map to disambiguate."
+        )
+        sales_field, sales_col_name = "net_sales", "Net Sales"
+    elif has_net:
+        sales_field, sales_col_name = "net_sales", "Net Sales"
+    elif has_gross:
+        sales_field, sales_col_name = "gross_sales", "Gross Sales"
+    else:
+        report.errors.append(
+            "Could not locate a 'Net Sales' or 'Gross Sales' column in the "
+            "booking file header — parsing aborted."
+        )
+        return pd.DataFrame(), "Sales"
+
+    col_start  = field_map["start"]
+    col_end    = field_map["end"]
+    col_host   = field_map["host"]
+    col_event  = field_map.get("event_name")      # also doubles as the room column
+    col_pay    = field_map.get("payment_type")
+    col_status = field_map.get("status")
+    col_resid  = field_map["res_id"]               # also doubles as the book_id column
+    col_sales  = field_map[sales_field]
+
     records = []
-    pending: dict = {}   # accumulator for the current booking block
-    
-    # Determine room column by scanning first 100 data rows
-    # The room name is always in col-5 on a row where col-0 and col-1 are NaT
-    # but col-2 is also NaT (unlike event rows where col-2 = host).
+    pending: dict = {}
 
     for _, row in raw_df.iterrows():
         # ── Skip total / page-footer rows ─────────────────────────────────────
         if _is_total_row(row):
             report.rows_skipped_total += 1
-            # Flush pending if it exists but has no room yet
             if pending:
                 records.append(pending)
                 pending = {}
             continue
 
-        v0 = row.iloc[0]
-        v1 = row.iloc[1]
-        v2 = row.iloc[2]
-        v5 = row.iloc[5]
-        v11 = row.iloc[11]
-        v13 = row.iloc[13]
-        v16 = row.iloc[16]
-        v18 = row.iloc[18]
+        v_start  = row.iloc[col_start]
+        v_end    = row.iloc[col_end]
+        v_host   = row.iloc[col_host]
+        v_event  = row.iloc[col_event]  if col_event  is not None else np.nan
+        v_pay    = row.iloc[col_pay]    if col_pay    is not None else np.nan
+        v_status = row.iloc[col_status] if col_status is not None else np.nan
+        v_resid  = row.iloc[col_resid]
+        v_sales  = row.iloc[col_sales]
 
         # ── Date-header row (midnight, no end time, no host) ──────────────────
-        if pd.notna(v0) and pd.isna(v1) and pd.isna(v2):
+        if pd.notna(v_start) and pd.isna(v_end) and pd.isna(v_host):
             report.rows_skipped_header += 1
             continue
 
         # ── Event data row (has start, end, and host) ─────────────────────────
-        if pd.notna(v0) and pd.notna(v1) and pd.notna(v2):
-            # Flush previous booking
+        if pd.notna(v_start) and pd.notna(v_end) and pd.notna(v_host):
             if pending:
                 records.append(pending)
                 pending = {}
 
             try:
-                start = pd.to_datetime(v0)
-                end   = pd.to_datetime(v1)
+                start = pd.to_datetime(v_start)
+                end   = pd.to_datetime(v_end)
             except Exception:
                 report.rows_skipped_bad_date += 1
                 continue
 
-            sales_raw = _safe_float(v18)
+            sales_raw = _safe_float(v_sales)
             sales = 0.0 if sales_raw is None else sales_raw
-            if sales_raw is None and _clean_str(v18) not in ("", "nan"):
+            if sales_raw is None and _clean_str(v_sales) not in ("", "nan"):
                 report.warnings.append(
-                    f"Non-numeric {sales_col_name} '{v18}' on "
-                    f"{start.date()} – {_clean_str(v2)[:40]}; treated as 0."
+                    f"Non-numeric {sales_col_name} '{v_sales}' on "
+                    f"{start.date()} – {_clean_str(v_host)[:40]}; treated as 0."
                 )
 
             pending = {
                 "start":        start,
                 "end":          end,
                 "duration_hrs": round((end - start).total_seconds() / 3600, 2),
-                "host":         _clean_str(v2),
-                "event_name":   _clean_str(v5),
-                "payment_type": _clean_str(v11),
-                "status":       _clean_str(v13),
-                "res_id":       _clean_str(v16) if pd.notna(v16) else "",
+                "host":         _clean_str(v_host),
+                "event_name":   _clean_str(v_event),
+                "payment_type": _clean_str(v_pay),
+                "status":       _clean_str(v_status),
+                "res_id":       _clean_str(v_resid) if pd.notna(v_resid) else "",
                 "book_id":      "",
                 "room":         "",
                 sales_col_name: sales,
@@ -223,13 +382,13 @@ def _parse_booking_sheet(
 
         # ── Continuation row (book_id or room) ────────────────────────────────
         if pending:
-            # Book ID row: col-16 has a numeric-ish string, col-5 is blank
-            if pd.notna(v16) and pd.isna(v5):
-                pending["book_id"] = _clean_str(v16)
-            # Room row: col-5 has the room name
-            if pd.notna(v5) and pd.isna(v0):
+            # Book ID row: res_id column has a numeric-ish string, event col is blank
+            if pd.notna(v_resid) and pd.isna(v_event):
+                pending["book_id"] = _clean_str(v_resid)
+            # Room row: event_name column has the room name
+            if pd.notna(v_event) and pd.isna(v_start):
                 existing_room = pending.get("room", "")
-                room_str = _clean_str(v5)
+                room_str = _clean_str(v_event)
                 if existing_room == "":
                     pending["room"] = room_str
                 # else already set; EMS sometimes repeats room on a 3rd continuation row
@@ -242,7 +401,7 @@ def _parse_booking_sheet(
     df = pd.DataFrame(records)
 
     if df.empty:
-        return df
+        return df, sales_col_name
 
     # ── Post-parse cleanup ────────────────────────────────────────────────────
     df[sales_col_name] = pd.to_numeric(df[sales_col_name], errors="coerce").fillna(0.0)
@@ -252,52 +411,65 @@ def _parse_booking_sheet(
     # Count genuine zeros (internal/ASU events billed at $0)
     report.zero_sales_count = int((df[sales_col_name] == 0).sum())
 
-    return df
+    return df, sales_col_name
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Host summary file parser
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _parse_host_sheet(raw_df: pd.DataFrame) -> pd.DataFrame:
+def _parse_host_sheet(
+    raw_df: pd.DataFrame,
+    schema_map: Optional[SchemaOverride] = None,
+) -> pd.DataFrame:
     """
-    Column map for the Host summary report:
-      1  – Host Type  (ASU / Public / SkySong Affiliate / SkySong Tenants)
-      5  – Host name
-      11 – Setup Count
-      13 – Attendance
-      17 – Gross Sales
+    Parse the Host summary report. Column positions are resolved at
+    runtime from the header block (Host Type / Host / Setup Count /
+    Attendance / Gross Sales), not assumed from a fixed layout.
     """
+    field_map = _build_field_map(raw_df, HOST_FIELD_ALIASES)
+    field_map = _apply_schema_overrides(raw_df, field_map, schema_map)
+
+    missing = [f for f in HOST_REQUIRED_FIELDS if f not in field_map]
+    if missing:
+        return pd.DataFrame()
+
+    col_host_type = field_map.get("host_type")
+    col_host      = field_map["host"]
+    col_setup     = field_map.get("setup_count")
+    col_attend    = field_map.get("attendance")
+    col_gross     = field_map["gross_sales"]
+
     records = []
     current_host_type = "Unknown"
 
     for _, row in raw_df.iterrows():
-        v1  = row.iloc[1]
-        v5  = row.iloc[5]
-        v11 = row.iloc[11]
-        v13 = row.iloc[13]
-        v17 = row.iloc[17]
+        v_type   = row.iloc[col_host_type] if col_host_type is not None else np.nan
+        v_host   = row.iloc[col_host]
+        v_setup  = row.iloc[col_setup]  if col_setup  is not None else np.nan
+        v_attend = row.iloc[col_attend] if col_attend is not None else np.nan
+        v_gross  = row.iloc[col_gross]
 
         # Update host type header
-        s1 = _clean_str(v1)
-        if s1 and s1 not in ("Host Type", "Total", "Grand Total"):
-            current_host_type = s1
+        s_type = _clean_str(v_type)
+        if s_type and s_type not in ("Host Type", "Total", "Grand Total"):
+            current_host_type = s_type
 
         # Skip non-data rows
-        if pd.isna(v5):
+        if pd.isna(v_host):
             continue
-        host_name = _clean_str(v5)
+        host_name = _clean_str(v_host)
         if not host_name or host_name in ("Host", "nan"):
             continue
         if re.match(r"^Page \d+ of \d+$", host_name):
             continue
 
-        setup     = _safe_float(v11)
-        attend    = _safe_float(v13)
-        gross     = _safe_float(v17)
+        setup  = _safe_float(v_setup)
+        attend = _safe_float(v_attend)
+        gross  = _safe_float(v_gross)
 
-        # Skip total aggregation rows (col-11 may say "Total")
-        if _clean_str(v11) == "Total":
+        # Skip total aggregation rows (setup column may say "Total")
+        if _clean_str(v_setup) == "Total":
             continue
 
         if gross is None:
@@ -331,6 +503,8 @@ def _cross_validate(df_net: pd.DataFrame, df_gross: pd.DataFrame, report: Valida
         return
 
     if "res_id" not in df_net.columns or "res_id" not in df_gross.columns:
+        return
+    if "Net Sales" not in df_net.columns or "Gross Sales" not in df_gross.columns:
         return
 
     net_by_res  = df_net.groupby("res_id")["Net Sales"].sum()
@@ -457,62 +631,178 @@ def _apply_host_type(bookings: pd.DataFrame, host_summary: pd.DataFrame, report:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Net/Gross merge (with reconciliation guard)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _merge_net_and_gross(
+    df_net: pd.DataFrame,
+    df_gross: pd.DataFrame,
+    report: ValidationReport,
+) -> pd.DataFrame:
+    """
+    Combine the Net and Gross booking frames into one row-per-booking table.
+
+    IMPORTANT: (res_id, start) is NOT a unique key on its own — EMS assigns
+    the same reservation ID to recurring / multi-room bookings that share a
+    start timestamp. Joining on that pair directly produces a many-to-many
+    merge: every duplicate-key row on the left is cross-joined against every
+    duplicate-key row on the right sharing that key, multiplying (not just
+    duplicating) their dollar totals. That was the root cause of the
+    dashboard reporting Gross/Net totals roughly 1.5x too high.
+
+    Fix: disambiguate duplicate keys with a per-group occurrence index
+    (`cumcount`) before merging, so the join is always 1:1. Both files are
+    exports of the same underlying booking sequence, so the Nth occurrence
+    of a given (res_id, start) in the Net file corresponds to the Nth
+    occurrence in the Gross file.
+
+    A reconciliation check re-sums both files independently and compares
+    against the merged totals; any drift is logged as a hard error instead
+    of being silently returned, so this class of bug fails loudly next time.
+    """
+    if df_net.empty or df_gross.empty:
+        return df_net if not df_net.empty else df_gross
+
+    merge_keys = ["res_id", "start"]
+    df_net = df_net.copy()
+    df_gross = df_gross.copy()
+    df_net["_occurrence"] = df_net.groupby(merge_keys).cumcount()
+    df_gross["_occurrence"] = df_gross.groupby(merge_keys).cumcount()
+    join_keys = merge_keys + ["_occurrence"]
+
+    gross_cols = join_keys + ["Gross Sales"]
+    bookings = df_net.merge(
+        df_gross[gross_cols],
+        on=join_keys,
+        how="left",
+        suffixes=("", "_gross"),
+    )
+    bookings.drop(columns="_occurrence", inplace=True)
+    df_net.drop(columns="_occurrence", inplace=True)
+    # Fill unmatched gross with 0 (do NOT fabricate)
+    bookings["Gross Sales"] = bookings["Gross Sales"].fillna(0.0)
+
+    dup_groups = int((df_net.groupby(merge_keys).size() > 1).sum())
+    if dup_groups:
+        report.warnings.append(
+            f"{dup_groups} (Res ID, Start) combinations repeat within the Net "
+            "Sales file (multi-room / recurring bookings sharing a reservation "
+            "ID); disambiguated by occurrence order before merging with Gross."
+        )
+
+    # ── Reconciliation guard ──────────────────────────────────────────────────
+    if len(bookings) != len(df_net):
+        report.errors.append(
+            f"Merge row count drifted from source: the Net file parsed to "
+            f"{len(df_net)} bookings but the merged dataset has {len(bookings)}. "
+            "The Net and Gross files could not be uniquely aligned — check for "
+            "reordered or mismatched duplicate Res ID blocks between the two files."
+        )
+
+    pre_gross, post_gross = round(df_gross["Gross Sales"].sum(), 2), round(bookings["Gross Sales"].sum(), 2)
+    pre_net, post_net = round(df_net["Net Sales"].sum(), 2), round(bookings["Net Sales"].sum(), 2)
+    if abs(post_gross - pre_gross) > 0.01:
+        report.errors.append(
+            f"Gross Sales total changed during the Net/Gross merge (source file "
+            f"total={pre_gross:.2f}, merged total={post_gross:.2f}). Refusing to "
+            "trust these totals — investigate duplicate Res IDs before proceeding."
+        )
+    if abs(post_net - pre_net) > 0.01:
+        report.errors.append(
+            f"Net Sales total changed during the Net/Gross merge (source file "
+            f"total={pre_net:.2f}, merged total={post_net:.2f}). Refusing to "
+            "trust these totals — investigate duplicate Res IDs before proceeding."
+        )
+
+    return bookings
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_ems_files(
-    net_path: str | Path,
-    gross_path: str | Path,
-    host_path: str | Path,
+    net_path: Union[str, Path],
+    gross_path: Union[str, Path],
+    host_path: Union[str, Path],
+    schema_map: Optional[dict[str, SchemaOverride]] = None,
 ) -> ParsedDataset:
     """
     Parse all three EMS export files and return a unified ParsedDataset.
 
     Parameters
     ----------
-    net_path   : path to EMS_Net_Sales_by_Booking_*.xlsx
-    gross_path : path to Gross_Sales_by_Booking_*.xlsx
-    host_path  : path to Gross_Sales_by_Host_*.xlsx
+    net_path   : path to the "Net Sales by Booking" export
+    gross_path : path to the "Gross Sales by Booking" export
+    host_path  : path to the "Gross Sales by Host" export
+    schema_map : optional {"net": {...}, "gross": {...}, "host": {...}}
+                 overrides for files whose column headers don't match the
+                 built-in aliases — each value maps canonical_field ->
+                 column index (int) or header text to search for (str).
 
     Returns
     -------
     ParsedDataset with .bookings (merged), .host_summary, .validation
     """
     report = ValidationReport()
+    schema_map = schema_map or {}
 
     # ── Read raw sheets ───────────────────────────────────────────────────────
     try:
-        raw_net   = pd.read_excel(net_path,   sheet_name="Sheet1", header=None)
-        raw_gross = pd.read_excel(gross_path, sheet_name="Sheet1", header=None)
-        raw_host  = pd.read_excel(host_path,  sheet_name="Sheet1", header=None)
+        raw_net   = pd.read_excel(net_path,   sheet_name=0, header=None)
+        raw_gross = pd.read_excel(gross_path, sheet_name=0, header=None)
+        raw_host  = pd.read_excel(host_path,  sheet_name=0, header=None)
     except Exception as exc:
         report.errors.append(f"File read error: {exc}")
         return ParsedDataset(validation=report)
 
     period = _extract_reporting_period(raw_net)
 
-    # ── Parse each file ───────────────────────────────────────────────────────
-    df_net   = _parse_booking_sheet(raw_net,   "Net Sales",   report)
-    df_gross = _parse_booking_sheet(raw_gross, "Gross Sales", report)
-    df_host  = _parse_host_sheet(raw_host)
+    # ── Parse each file (schema resolved dynamically from headers) ───────────
+    df_net,   net_col   = _parse_booking_sheet(raw_net,   report, schema_map.get("net"))
+    df_gross, gross_col = _parse_booking_sheet(raw_gross, report, schema_map.get("gross"))
+    df_host = _parse_host_sheet(raw_host, schema_map.get("host"))
+
+    # The caller's net_path/gross_path labels are just a hint — the file's
+    # actual header is what determines its role. If the two are swapped
+    # (net_path points at the file containing "Gross Sales" and vice versa),
+    # self-correct from the detected columns rather than trusting the label.
+    if net_col == "Gross Sales" and gross_col == "Net Sales":
+        report.warnings.append(
+            "The file passed as the Net Sales booking file actually contains a "
+            "Gross Sales column (and vice versa) — the two files appear to be "
+            "swapped. Auto-corrected based on detected header content."
+        )
+        df_net, df_gross = df_gross, df_net
+        net_col, gross_col = gross_col, net_col
+    elif not df_net.empty and not df_gross.empty and net_col == gross_col:
+        report.errors.append(
+            f"Both booking files resolved to the same sales column ('{net_col}') "
+            "— the Net and Gross files may be swapped, or one is missing its "
+            "expected header. Check the uploaded files."
+        )
+
+    if not df_net.empty and "Net Sales" not in df_net.columns:
+        report.errors.append(
+            "The file provided as the Net Sales booking file does not contain a "
+            "Net Sales column after parsing — aborting rather than compute on the "
+            "wrong data."
+        )
+        return ParsedDataset(validation=report, reporting_period=period)
+    if not df_gross.empty and "Gross Sales" not in df_gross.columns:
+        report.errors.append(
+            "The file provided as the Gross Sales booking file does not contain a "
+            "Gross Sales column after parsing — aborting rather than compute on the "
+            "wrong data."
+        )
+        return ParsedDataset(validation=report, reporting_period=period)
 
     # ── Cross-validate ────────────────────────────────────────────────────────
     _cross_validate(df_net, df_gross, report)
 
-    # ── Merge net + gross on res_id + start ───────────────────────────────────
-    if df_net.empty or df_gross.empty:
-        bookings = df_net if not df_net.empty else df_gross
-    else:
-        merge_keys = ["res_id", "start"]
-        gross_cols = merge_keys + ["Gross Sales"]
-        bookings = df_net.merge(
-            df_gross[gross_cols],
-            on=merge_keys,
-            how="left",
-            suffixes=("", "_gross"),
-        )
-        # Fill unmatched gross with 0 (do NOT fabricate)
-        bookings["Gross Sales"] = bookings["Gross Sales"].fillna(0.0)
+    # ── Merge net + gross (see _merge_net_and_gross for the reconciliation
+    #    guard that catches duplicate-key fan-out before it reaches the UI) ──
+    bookings = _merge_net_and_gross(df_net, df_gross, report)
 
     # ── Derived columns ───────────────────────────────────────────────────────
     if not bookings.empty:
@@ -543,7 +833,11 @@ def parse_ems_files(
     )
 
 
-def parse_single_file(filepath: str | Path, file_role: str) -> dict:
+def parse_single_file(
+    filepath: Union[str, Path],
+    file_role: str,
+    schema_map: Optional[SchemaOverride] = None,
+) -> dict:
     """
     Parse a single uploaded file. file_role ∈ {'net', 'gross', 'host'}.
     Returns a dict with 'data' (list of dicts) and 'validation'.
@@ -552,10 +846,15 @@ def parse_single_file(filepath: str | Path, file_role: str) -> dict:
     report = ValidationReport()
 
     if file_role == "host":
-        df = _parse_host_sheet(raw)
+        df = _parse_host_sheet(raw, schema_map)
     else:
-        sales_col = "Net Sales" if file_role == "net" else "Gross Sales"
-        df = _parse_booking_sheet(raw, sales_col, report)
+        df, detected_col = _parse_booking_sheet(raw, report, schema_map)
+        expected_col = "Net Sales" if file_role == "net" else "Gross Sales"
+        if not df.empty and detected_col != expected_col:
+            report.warnings.append(
+                f"File was labeled '{file_role}' but its header indicates "
+                f"'{detected_col}', not '{expected_col}'. Using the detected column."
+            )
         if not df.empty:
             df["segment"] = df["host"].apply(_classify_host_segment)
 

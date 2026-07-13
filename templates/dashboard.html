@@ -611,9 +611,13 @@ function renderKPIs(k) {
 // Validation warnings
 // ─────────────────────────────────────────────────────────────────────────────
 function renderWarnings(v) {
-  if (!v || !v.warnings || !v.warnings.length) return;
   const banner = document.getElementById('warnBanner');
   const list   = document.getElementById('warnList');
+  list.innerHTML = '';
+  if (!v || !v.warnings || !v.warnings.length) {
+    banner.style.display = 'none';
+    return;
+  }
   banner.style.display = 'block';
   v.warnings.slice(0,5).forEach(w => {
     const li = document.createElement('li');
