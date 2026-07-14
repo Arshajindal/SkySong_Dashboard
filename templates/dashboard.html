@@ -370,8 +370,8 @@ tr:hover td { background: var(--hover-bg); }
       <div class="chart-wrap tall"><canvas id="chartRooms"></canvas></div>
     </div>
     <div class="chart-card">
-      <h3>Booking Status Distribution</h3>
-      <div class="chart-wrap"><canvas id="chartStatus"></canvas></div>
+      <h3>Revenue by Payment / Billing Type</h3>
+      <div class="chart-wrap tall"><canvas id="chartPayment"></canvas></div>
     </div>
   </div>
   <div class="chart-grid">
@@ -388,12 +388,6 @@ tr:hover td { background: var(--hover-bg); }
     <div class="chart-card">
       <h3>Booking Activity Heatmap (Day × Hour)</h3>
       <div class="chart-wrap tall"><canvas id="chartHeatmap"></canvas></div>
-    </div>
-  </div>
-  <div class="chart-grid single">
-    <div class="chart-card">
-      <h3>Revenue by Payment / Billing Type</h3>
-      <div class="chart-wrap"><canvas id="chartPayment"></canvas></div>
     </div>
   </div>
 </div>
@@ -605,7 +599,6 @@ function renderAll(d) {
   renderTopHosts(d.top_hosts);
   renderHostTypes(d.host_type_detail);
   renderRooms(d.room_utilisation);
-  renderStatus(d.status_breakdown);
   renderWeekday(d.weekday_summary);
   renderDuration(d.duration_dist);
   renderHeatmap(d.booking_heatmap);
@@ -887,24 +880,6 @@ function renderRooms(d) {
         x: { grid: { color: gridColor() } },
         y: { grid: { display: false }, ticks: { font: { size: 10 } } },
       },
-    },
-  });
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Status pie
-// ─────────────────────────────────────────────────────────────────────────────
-function renderStatus(d) {
-  if (!d || !d.labels) return;
-  new Chart(document.getElementById('chartStatus'), {
-    type: 'pie',
-    data: {
-      labels: d.labels,
-      datasets: [{ data: d.counts, backgroundColor: PALETTE, borderColor: cssVar('--card-bg'), borderWidth: 2 }],
-    },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { position: 'bottom' } },
     },
   });
 }
