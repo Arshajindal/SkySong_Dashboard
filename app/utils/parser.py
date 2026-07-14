@@ -537,6 +537,15 @@ def _cross_validate(df_net: pd.DataFrame, df_gross: pd.DataFrame, report: Valida
 # Classify host segment
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Hosts that must always resolve to their own standalone segment, overriding
+# whatever host_type the Host summary file assigns them. ASU EdPlus is its
+# own peer entity, not a SkySong tenant, regardless of how the source Excel
+# groups it.
+SEGMENT_OVERRIDES: dict[str, str] = {
+    "ASU EDPLUS": "ASU EdPlus",
+}
+
+
 def _classify_host_segment(host: str) -> str:
     """
     Derive a client-segment label from the host name using keyword matching.
@@ -609,6 +618,8 @@ def _apply_host_type(bookings: pd.DataFrame, host_summary: pd.DataFrame, report:
 
     def _resolve(host: str) -> tuple[str, str]:
         key = _normalize_host_key(host)
+        if key in SEGMENT_OVERRIDES:
+            return SEGMENT_OVERRIDES[key], "override"
         if key in lookup:
             return lookup[key], "host_file"
         return _classify_host_segment(host), "heuristic"

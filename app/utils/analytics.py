@@ -196,6 +196,7 @@ def top_hosts(
     bookings: pd.DataFrame,
     host_summary: pd.DataFrame,
     n: int = 15,
+    sort_by: str = "net",
 ) -> list[dict]:
     """
     Ranked table: top revenue-generating hosts.
@@ -206,9 +207,14 @@ def top_hosts(
     from the Host file during parsing (see _apply_host_type in parser.py),
     so ranking and segmentation both stay consistent with the rest of the
     dashboard's revenue numbers.
+
+    `sort_by` selects which metric ranks the top N: "gross" or "net".
     """
     if bookings.empty:
         return []
+
+    if sort_by not in ("gross", "net"):
+        sort_by = "gross"
 
     grp = (
         bookings.groupby("host")
@@ -219,7 +225,7 @@ def top_hosts(
             segment=("segment", "first"),
         )
         .reset_index()
-        .sort_values("gross", ascending=False)
+        .sort_values(sort_by, ascending=False)
         .head(n)
     )
     return [
@@ -273,16 +279,16 @@ def room_utilisation(bookings: pd.DataFrame, n: int = 20) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def booking_heatmap(bookings: pd.DataFrame) -> dict:
-    """7×24 heatmap: number of events per weekday × start hour."""
+    """7×15 heatmap: number of events per weekday × start hour."""
     if bookings.empty:
         return {"days": [], "hours": [], "matrix": []}
 
     days_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-    hours = list(range(6, 23))  # 6 AM – 10 PM practical range
+    hours = list(range(6, 21))  # 6 AM – 8 PM practical range
 
     b = bookings.copy()
     b["weekday"] = pd.Categorical(b["weekday"], categories=days_order, ordered=True)
-    b["hour_bin"] = b["hour"].clip(6, 22)
+    b["hour_bin"] = b["hour"].clip(6, 20)
 
     pivot = (
         b.groupby(["weekday", "hour_bin"])
@@ -299,21 +305,21 @@ def booking_heatmap(bookings: pd.DataFrame) -> dict:
 
 
 def weekday_summary(bookings: pd.DataFrame) -> dict:
-    """Bar chart: average Gross Sales by day of week."""
+    """Bar chart: total Gross Sales by day of week."""
     if bookings.empty:
-        return {"labels": [], "avg_gross": [], "total_events": []}
+        return {"labels": [], "total_gross": [], "total_events": []}
 
     days_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
     grp = (
         bookings.groupby("weekday")
-        .agg(avg_gross=("Gross Sales", "mean"), events=("res_id", "count"))
+        .agg(total_gross=("Gross Sales", "sum"), events=("res_id", "count"))
         .reindex(days_order)
         .fillna(0)
         .reset_index()
     )
     return {
         "labels":       grp["weekday"].tolist(),
-        "avg_gross":    [_round2(v) for v in grp["avg_gross"]],
+        "total_gross":  [_round2(v) for v in grp["total_gross"]],
         "total_events": grp["events"].astype(int).tolist(),
     }
 

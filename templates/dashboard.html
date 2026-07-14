@@ -96,6 +96,26 @@
   letter-spacing: .6px;
   margin-bottom: 1.2rem;
 }
+.card-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: .75rem;
+  flex-wrap: wrap;
+}
+.card-header-row h3 { margin-bottom: 0; }
+.card-header-row select {
+  background: var(--gray-700);
+  border: 1px solid var(--card-border);
+  color: var(--text);
+  border-radius: 8px;
+  padding: .45rem .75rem;
+  font-size: .78rem;
+  margin-bottom: 1.2rem;
+}
+.card-header-row select:focus {
+  outline: none; border-color: var(--gold);
+}
 .chart-wrap { position: relative; height: 300px; }
 .chart-wrap.tall  { height: 380px; }
 .chart-wrap.short { height: 220px; }
@@ -193,7 +213,7 @@ tr:hover td { background: var(--hover-bg); }
 .warn-banner ul { padding-left: 1rem; margin-top: .4rem; color: var(--text-muted); }
 
 /* ── Ranked table (top hosts) ───────────────────────────────────── */
-.rank-table { width: 100%; border-collapse: collapse; font-size: .83rem; }
+.rank-table { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: .83rem; }
 .rank-table th {
   text-align: left; padding: .5rem;
   font-size: .7rem; text-transform: uppercase; letter-spacing: .5px;
@@ -311,16 +331,22 @@ tr:hover td { background: var(--hover-bg); }
   </div>
   <div class="chart-grid single">
     <div class="chart-card">
-      <h3>Top 15 Clients by Revenue</h3>
+      <div class="card-header-row">
+        <h3>Top 15 Clients by Revenue</h3>
+        <select id="topHostsSort" onchange="loadTopHosts()">
+          <option value="net" selected>Net Revenue</option>
+          <option value="gross">Gross Revenue</option>
+        </select>
+      </div>
       <div style="max-height:400px;overflow-y:auto;">
         <table class="rank-table" id="topHostsTable">
           <thead>
             <tr>
-              <th style="width:36px"></th>
-              <th>Client</th>
-              <th style="width:120px">Share</th>
-              <th style="text-align:right">Gross</th>
-              <th style="text-align:right">Net</th>
+              <th style="width:4%"></th>
+              <th style="width:34%">Client</th>
+              <th style="width:18%">Share</th>
+              <th style="width:22%;text-align:right">Net</th>
+              <th style="width:22%;text-align:right">Gross</th>
             </tr>
           </thead>
           <tbody id="topHostsBody"></tbody>
@@ -344,13 +370,13 @@ tr:hover td { background: var(--hover-bg); }
       <div class="chart-wrap tall"><canvas id="chartRooms"></canvas></div>
     </div>
     <div class="chart-card">
-      <h3>Booking Status Distribution</h3>
-      <div class="chart-wrap"><canvas id="chartStatus"></canvas></div>
+      <h3>Revenue by Payment / Billing Type</h3>
+      <div class="chart-wrap tall"><canvas id="chartPayment"></canvas></div>
     </div>
   </div>
   <div class="chart-grid">
     <div class="chart-card">
-      <h3>Average Revenue by Day of Week</h3>
+      <h3>Total Revenue by Day of Week (Gross)</h3>
       <div class="chart-wrap"><canvas id="chartWeekday"></canvas></div>
     </div>
     <div class="chart-card">
@@ -362,12 +388,6 @@ tr:hover td { background: var(--hover-bg); }
     <div class="chart-card">
       <h3>Booking Activity Heatmap (Day × Hour)</h3>
       <div class="chart-wrap tall"><canvas id="chartHeatmap"></canvas></div>
-    </div>
-  </div>
-  <div class="chart-grid single">
-    <div class="chart-card">
-      <h3>Revenue by Payment / Billing Type</h3>
-      <div class="chart-wrap"><canvas id="chartPayment"></canvas></div>
     </div>
   </div>
 </div>
@@ -513,6 +533,7 @@ const PALETTE = [
 // segment name not listed here (e.g. a new host_type value later).
 const SEGMENT_COLORS = {
   'ASU':                      '#FFC627',
+  'ASU EdPlus':               '#8C1D40',
   'Public':                   '#3498db',
   'SkySong Affliate':         '#2ecc71',
   'SkySong Tenants':          '#9b59b6',
@@ -579,7 +600,6 @@ function renderAll(d) {
   renderTopHosts(d.top_hosts);
   renderHostTypes(d.host_type_detail);
   renderRooms(d.room_utilisation);
-  renderStatus(d.status_breakdown);
   renderWeekday(d.weekday_summary);
   renderDuration(d.duration_dist);
   renderHeatmap(d.booking_heatmap);
@@ -784,21 +804,28 @@ function renderSegment(d) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Top Hosts ranked list
 // ─────────────────────────────────────────────────────────────────────────────
-function renderTopHosts(hosts) {
+async function loadTopHosts() {
+  const sortBy = document.getElementById('topHostsSort').value;
+  const res  = await fetch('/api/top-hosts?n=15&sort_by=' + sortBy);
+  const data = await res.json();
+  renderTopHosts(data, sortBy);
+}
+
+function renderTopHosts(hosts, sortBy = 'net') {
   if (!hosts || !hosts.length) return;
   const tbody = document.getElementById('topHostsBody');
-  const maxGross = Math.max(...hosts.map(h => h.gross));
+  const maxVal = Math.max(...hosts.map(h => h[sortBy]));
   tbody.innerHTML = hosts.map((h) => `
     <tr>
       <td class="rank-num">#${h.rank}</td>
-      <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;" title="${h.host}">${h.host}</td>
-      <td style="width:120px">
+      <td style="overflow:hidden;white-space:nowrap;text-overflow:ellipsis;" title="${h.host}">${h.host}</td>
+      <td>
         <div class="rank-bar-wrap">
-          <div class="rank-bar-fill" style="width:${(h.gross/maxGross*100).toFixed(0)}%"></div>
+          <div class="rank-bar-fill" style="width:${(h[sortBy]/maxVal*100).toFixed(0)}%"></div>
         </div>
       </td>
-      <td class="money" style="text-align:right">${fmt$(h.gross)}</td>
       <td class="money" style="text-align:right;color:var(--info)">${fmt$(h.net)}</td>
+      <td class="money" style="text-align:right">${fmt$(h.gross)}</td>
     </tr>
   `).join('');
 }
@@ -859,24 +886,6 @@ function renderRooms(d) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Status pie
-// ─────────────────────────────────────────────────────────────────────────────
-function renderStatus(d) {
-  if (!d || !d.labels) return;
-  new Chart(document.getElementById('chartStatus'), {
-    type: 'pie',
-    data: {
-      labels: d.labels,
-      datasets: [{ data: d.counts, backgroundColor: PALETTE, borderColor: cssVar('--card-bg'), borderWidth: 2 }],
-    },
-    options: {
-      responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { position: 'bottom' } },
-    },
-  });
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Weekday bar
 // ─────────────────────────────────────────────────────────────────────────────
 function renderWeekday(d) {
@@ -885,11 +894,11 @@ function renderWeekday(d) {
     type: 'bar',
     data: {
       labels: d.labels.map(l => l.slice(0,3)),
-      datasets: [{ label: 'Avg Gross', data: d.avg_gross, backgroundColor: PALETTE, borderWidth: 0 }],
+      datasets: [{ label: 'Total Gross', data: d.total_gross, backgroundColor: PALETTE, borderWidth: 0 }],
     },
     options: {
       responsive: true, maintainAspectRatio: false,
-      plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => ' Avg: ' + fmt$(ctx.raw) }}},
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: ctx => ' Total: ' + fmt$(ctx.raw) }}},
       scales: {
         y: { ticks: { callback: v => fmt$(v) }, grid: { color: gridColor() } },
         x: { grid: { display: false } },

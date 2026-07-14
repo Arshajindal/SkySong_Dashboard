@@ -101,8 +101,9 @@ def api_top_hosts():
     err = _require_data()
     if err: return err
     n = request.args.get("n", 15, type=int)
+    sort_by = request.args.get("sort_by", "net", type=str)
     s = get_store()
-    return jsonify(_clean(top_hosts(s.bookings, s.host_summary, n=n)))
+    return jsonify(_clean(top_hosts(s.bookings, s.host_summary, n=n, sort_by=sort_by)))
 
 
 @api_bp.route("/rooms")

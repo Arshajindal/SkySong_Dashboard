@@ -110,7 +110,8 @@
       color: var(--text);
     }
     .navbar-period {
-      font-size: .78rem;
+      font-size: 1rem;
+      font-weight: 700;
       color: var(--text-muted);
       margin-left: 8px;
     }
@@ -180,8 +181,8 @@
   <div class="navbar-brand">
     <span class="brand-badge">ASU KE</span>
     <span class="navbar-title">EMS Analytics Dashboard</span>
-    {% if reporting_period is defined and reporting_period %}
-      <span class="navbar-period">{{ reporting_period }}</span>
+    {% if fiscal_year_label is defined and fiscal_year_label %}
+      <span class="navbar-period">{{ fiscal_year_label }}</span>
     {% endif %}
   </div>
   <div class="navbar-actions">
