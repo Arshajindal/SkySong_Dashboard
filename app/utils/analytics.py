@@ -279,16 +279,16 @@ def room_utilisation(bookings: pd.DataFrame, n: int = 20) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def booking_heatmap(bookings: pd.DataFrame) -> dict:
-    """7×24 heatmap: number of events per weekday × start hour."""
+    """7×15 heatmap: number of events per weekday × start hour."""
     if bookings.empty:
         return {"days": [], "hours": [], "matrix": []}
 
     days_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-    hours = list(range(6, 23))  # 6 AM – 10 PM practical range
+    hours = list(range(6, 21))  # 6 AM – 8 PM practical range
 
     b = bookings.copy()
     b["weekday"] = pd.Categorical(b["weekday"], categories=days_order, ordered=True)
-    b["hour_bin"] = b["hour"].clip(6, 22)
+    b["hour_bin"] = b["hour"].clip(6, 20)
 
     pivot = (
         b.groupby(["weekday", "hour_bin"])
